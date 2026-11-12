@@ -1,0 +1,38 @@
+name: Open WebUI reconnect-storm repro
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "trigger: redis | redis-oom | db-stall"
+        default: "redis"
+
+jobs:
+  repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: ["v0.13.3", "dev"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Run reproduction
+        run: |
+          chmod +x run_check.sh
+          ./run_check.sh "${{ matrix.tag }}" "${{ github.event.inputs.mode || 'redis' }}"
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.tag }}-${{ github.event.inputs.mode || 'redis' }}
+          path: results/

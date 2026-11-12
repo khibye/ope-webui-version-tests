@@ -1,0 +1,73 @@
+
+# Reproduction stack for: "Redis loss / DB stall under load -> reconnect storm -> DB pool exhaustion"
+#
+#   OWUI_TAG=v0.13.3 docker compose up -d      # latest release
+#   OWUI_TAG=dev     docker compose up -d      # current dev image
+#
+# The DB pool is made deliberately tiny (POOL_SIZE=2, no overflow, 5 s timeout)
+# so that ~20 browser tabs are enough to reproduce what 50k users do in production.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: owui
+      POSTGRES_PASSWORD: owui
+      POSTGRES_DB: owui
+    command: ["postgres", "-c", "max_connections=200"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U owui -d owui"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    # No persistence: a recreated Redis pod in Kubernetes comes back empty, so do we.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:${OWUI_TAG:-v0.13.3}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "${OWUI_PORT:-3000}:8080"
+    environment:
+      WEBUI_SECRET_KEY: repro-secret-key-not-for-production
+      WEBUI_URL: http://localhost:${OWUI_PORT:-3000}
+
+      # --- database (tiny pool on purpose) ---
+      DATABASE_URL: postgresql://owui:owui@postgres:5432/owui
+      DATABASE_POOL_SIZE: ${POOL_SIZE:-2}
+      DATABASE_POOL_MAX_OVERFLOW: ${POOL_OVERFLOW:-0}
+      DATABASE_POOL_TIMEOUT: ${POOL_TIMEOUT:-5}
+
+      # --- redis, same topology as production ---
+      REDIS_URL: redis://redis:6379/0
+      WEBSOCKET_MANAGER: redis
+      WEBSOCKET_REDIS_URL: redis://redis:6379/1
+      ENABLE_WEBSOCKET_SUPPORT: "true"
+
+      # --- make user creation via API possible ---
+      ENABLE_SIGNUP: "true"
+      DEFAULT_USER_ROLE: user
+
+      # --- no model backends needed for this bug ---
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "false"
+
+      GLOBAL_LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s

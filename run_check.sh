@@ -53,7 +53,11 @@ curl -fsS "$URL/health" >/dev/null 2>&1 || { log "Open WebUI did not become heal
 VERSION=$(curl -fsS "$URL/api/version" 2>/dev/null)
 log "Open WebUI is up: $VERSION"
 echo "$VERSION" > "$OUT/version.json"
-docker compose exec -T open-webui sh -c 'cd /app/backend 2>/dev/null && git rev-parse HEAD 2>/dev/null || cat /app/.git/HEAD 2>/dev/null' > "$OUT/commit.txt" 2>/dev/null
+IMG="ghcr.io/open-webui/open-webui:$TAG"
+REV=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMG" 2>/dev/null)
+DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG" 2>/dev/null)
+log "Image: $IMG  revision=${REV:-?}  digest=${DIGEST:-?}"
+printf "image=%s\nrevision=%s\ndigest=%s\n" "$IMG" "$REV" "$DIGEST" > "$OUT/image.txt"
 
 # ---------- 2. users & tabs ----------
 python3 setup_users.py --url "$URL" --users "$USERS" --out "$OUT/tokens.json" | tee -a "$OUT/run.log" || exit 1
@@ -128,6 +132,7 @@ WS_AFTER=$(awk -F, -v t="$(date -d "$T_TRIG" +%H:%M:%S 2>/dev/null || echo 00:00
   echo
   echo "================ RESULT ($TAG / $MODE) ================"
   echo "version:                  $VERSION"
+  echo "image:                    $IMG  revision=${REV:-?}"
   echo "tabs:                     $((USERS*TABS))  (pool size ${POOL_SIZE:-2}, overflow ${POOL_OVERFLOW:-0})"
   echo "QueuePool timeouts total: $TOTAL_TIMEOUTS   (baseline: $BASE_TIMEOUTS)"
   echo "'Session not found':      $TOTAL_SNF"

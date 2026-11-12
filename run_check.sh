@@ -16,6 +16,8 @@ USERS="${USERS:-5}"
 TABS="${TABS:-4}"
 BASELINE_S="${BASELINE_S:-90}"
 OBSERVE_S="${OBSERVE_S:-360}"
+REDIS_DOWN_S="${REDIS_DOWN_S:-60}"      # how long Redis stays gone (a rescheduled pod takes a while)
+DB_LATENCY_MS="${DB_LATENCY_MS:-100}"   # added to every DB round-trip from the trigger on (simulates a loaded DB)
 PORT="${OWUI_PORT:-3000}"
 URL="http://localhost:${PORT}"
 
@@ -79,11 +81,21 @@ if [ "$BASE_TIMEOUTS" -gt 0 ]; then
 fi
 
 # ---------- 4. trigger ----------
+if [ "$DB_LATENCY_MS" -gt 0 ]; then
+  log "Adding ${DB_LATENCY_MS}ms latency to every DB round-trip (toxiproxy) to simulate a loaded database"
+  docker compose exec -T dbproxy /toxiproxy-cli toxic add -n lat -t latency -a latency="$DB_LATENCY_MS" postgres >/dev/null 2>&1 \
+    || log "WARNING: could not add latency toxic"
+  sleep 20
+  snapshot "$(date -u -d '20 seconds ago' +%Y-%m-%dT%H:%M:%SZ)"
+fi
 T_TRIG=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 case "$MODE" in
   redis)
-    log "TRIGGER: recreating the Redis container (data lost, like a recreated pod)"
-    docker compose rm -sf redis >/dev/null && docker compose up -d redis >/dev/null
+    log "TRIGGER: removing the Redis container for ${REDIS_DOWN_S}s, then recreating it empty (like a rescheduled pod)"
+    docker compose rm -sf redis >/dev/null
+    sleep "$REDIS_DOWN_S"
+    docker compose up -d redis >/dev/null
+    log "Redis is back (empty)"
     ;;
   redis-oom)
     log "TRIGGER: Redis refuses writes for 60 s (maxmemory=1mb, noeviction)"
@@ -123,6 +135,11 @@ done
 # ---------- 6. collect & verdict ----------
 kill "$TABS_PID" 2>/dev/null; wait "$TABS_PID" 2>/dev/null
 docker compose logs --no-log-prefix --timestamps open-webui > "$OUT/open-webui.log" 2>&1
+{
+  echo "----- tabs.log (browser side) -----"; cat "$OUT/tabs.log"
+  echo "----- open-webui.log: redis/socket/pool related lines (last 80) -----"
+  grep -iE "redis|socket|QueuePool|Session not found|Traceback|Error" "$OUT/open-webui.log" | tail -80
+} | tee -a "$OUT/run.log"
 docker compose logs --no-log-prefix --timestamps redis > "$OUT/redis.log" 2>&1
 TOTAL_TIMEOUTS=$(grep -c 'QueuePool limit' "$OUT/open-webui.log")
 TOTAL_SNF=$(grep -c 'Session not found' "$OUT/open-webui.log")

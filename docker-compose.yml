@@ -21,6 +21,16 @@ services:
       timeout: 3s
       retries: 20
 
+  # TCP proxy in front of PostgreSQL so run_check.sh can add latency (simulates a loaded DB).
+  dbproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    command: ["-host", "0.0.0.0", "-config", "/config/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy.json:/config/toxiproxy.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   redis:
     image: redis:7-alpine
     # No persistence: a recreated Redis pod in Kubernetes comes back empty, so do we.
@@ -36,6 +46,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      dbproxy:
+        condition: service_started
       redis:
         condition: service_healthy
     ports:
@@ -45,7 +57,7 @@ services:
       WEBUI_URL: http://localhost:${OWUI_PORT:-3000}
 
       # --- database (tiny pool on purpose) ---
-      DATABASE_URL: postgresql://owui:owui@postgres:5432/owui
+      DATABASE_URL: postgresql://owui:owui@dbproxy:5432/owui
       DATABASE_POOL_SIZE: ${POOL_SIZE:-2}
       DATABASE_POOL_MAX_OVERFLOW: ${POOL_OVERFLOW:-0}
       DATABASE_POOL_TIMEOUT: ${POOL_TIMEOUT:-5}

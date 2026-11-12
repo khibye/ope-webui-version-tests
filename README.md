@@ -33,7 +33,11 @@ chmod +x run_check.sh
 ```
 Each run takes ~10 minutes and leaves the stack running; stop it with `docker compose down -v`.
 
-Tunables (environment variables): `USERS=5 TABS=4 POOL_SIZE=2 POOL_OVERFLOW=0 POOL_TIMEOUT=5 OBSERVE_S=360`.
+From the trigger on, `DB_LATENCY_MS` (default 100) of latency is added to every DB round-trip through a
+toxiproxy container, to stand in for a loaded production database; in `redis` mode Redis stays gone for
+`REDIS_DOWN_S` (default 60) seconds before it is recreated empty.
+
+Tunables (environment variables): `USERS=5 TABS=4 POOL_SIZE=2 POOL_OVERFLOW=0 POOL_TIMEOUT=5 OBSERVE_S=360 DB_LATENCY_MS=100 REDIS_DOWN_S=60`.
 If the baseline already shows pool timeouts, re-run with `POOL_SIZE=5`.
 
 ## What to look at

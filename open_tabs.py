@@ -102,7 +102,26 @@ def main():
         # NOTE: with the sync API, page events are only dispatched while a Playwright call is
         # running, so we must wait through Playwright, never time.sleep().
         pages[0].wait_for_timeout(20000)
+        # Diagnostics: are the tabs really logged in and connected?
+        logged_in = on_auth = has_token = 0
+        for pg in pages:
+            try:
+                info = pg.evaluate(
+                    "() => ({url: location.pathname, token: !!localStorage.getItem('token'),"
+                    " login: !!document.querySelector('input[type=password]')})"
+                )
+            except Exception:
+                info = {"url": "?", "token": False, "login": False}
+            has_token += bool(info["token"])
+            on_auth += info["url"].startswith("/auth") or info["login"]
+            logged_in += (not info["url"].startswith("/auth")) and not info["login"]
         with lock:
+            print(
+                f"DIAG tabs={len(pages)} logged_in={logged_in} on_login_page={on_auth} "
+                f"has_token={has_token} ws_opened_warmup={counts.get('ws_new', 0)} "
+                f"http_401_warmup={counts.get('http_401', 0)} chats_warmup={counts.get('chats', 0)}",
+                flush=True,
+            )
             counts.clear()  # ignore the initial page loads
 
         cols = ["ts", "ws_new", "version", "chats", "folders", "auths", "http_401", "http_429", "http_5xx"]

@@ -2,10 +2,6 @@ name: Open WebUI reconnect-storm repro
 
 on:
   workflow_dispatch:
-    inputs:
-      mode:
-        description: "trigger: redis | redis-oom | db-stall"
-        default: "redis"
 
 jobs:
   repro:
@@ -15,6 +11,7 @@ jobs:
       fail-fast: false
       matrix:
         tag: ["v0.13.3", "dev"]
+        mode: ["redis", "db-stall"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,12 +24,12 @@ jobs:
       - name: Run reproduction
         run: |
           chmod +x run_check.sh
-          ./run_check.sh "${{ matrix.tag }}" "${{ github.event.inputs.mode || 'redis' }}"
+          ./run_check.sh "${{ matrix.tag }}" "${{ matrix.mode }}"
       - name: Stop stack
         if: always()
         run: docker compose down -v || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: results-${{ matrix.tag }}-${{ github.event.inputs.mode || 'redis' }}
+          name: results-${{ matrix.tag }}-${{ matrix.mode }}
           path: results/

@@ -1,0 +1,76 @@
+name: Verify fix (patched image vs unpatched)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  patched:
+    name: "patched (${{ matrix.ref }}, ${{ matrix.mode }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: ["v0.13.3", "dev"]
+        mode: ["db-stall", "redis"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone Open WebUI ${{ matrix.ref }}
+        run: |
+          git clone --depth 1 --branch "${{ matrix.ref }}" https://github.com/open-webui/open-webui.git upstream
+          echo "UPSTREAM_SHA=$(git -C upstream rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Apply fix
+        run: |
+          python3 patches/apply_fix.py upstream
+          git -C upstream diff --stat
+          git -C upstream diff > "fix-${{ matrix.ref }}.diff"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: upstream/package-lock.json
+
+      - name: Build patched frontend
+        working-directory: upstream
+        run: |
+          ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --force
+          npm run build
+          ls build | head
+
+      - name: Build patched image on top of the official one
+        run: |
+          docker build -f patches/Dockerfile.patched \
+            --build-arg BASE_IMAGE=ghcr.io/open-webui/open-webui:${{ matrix.ref }} \
+            -t owui-patched:${{ matrix.ref }} upstream
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          python3 -m playwright install --with-deps chromium
+
+      - name: Run reproduction against the patched image
+        env:
+          OWUI_IMAGE: owui-patched:${{ matrix.ref }}
+          OWUI_IMAGE_LOCAL: "1"
+          LABEL: patched-${{ matrix.ref }}
+        run: |
+          chmod +x run_check.sh
+          ./run_check.sh "${{ matrix.ref }}" "${{ matrix.mode }}"
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-patched-${{ matrix.ref }}-${{ matrix.mode }}
+          path: |
+            results/
+            fix-${{ matrix.ref }}.diff

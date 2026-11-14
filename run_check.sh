@@ -22,8 +22,12 @@ PORT="${OWUI_PORT:-3000}"
 URL="http://localhost:${PORT}"
 
 export OWUI_TAG="$TAG" OWUI_PORT="$PORT"
+# OWUI_IMAGE=<local image> overrides the tag (used for patched builds); LABEL names the results folder.
+IMG="${OWUI_IMAGE:-ghcr.io/open-webui/open-webui:$TAG}"
+export OWUI_IMAGE="$IMG"
+LABEL="${LABEL:-${TAG//\//_}}"
 cd "$(dirname "$0")"
-OUT="results/${TAG//\//_}-${MODE}-$(date +%Y%m%d-%H%M%S)"
+OUT="results/${LABEL}-${MODE}-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$OUT"
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/run.log"; }
 
@@ -47,7 +51,9 @@ snapshot() {  # one observation line
 # ---------- 1. stack ----------
 log "Starting stack with image tag '$TAG' (pool size ${POOL_SIZE:-2}, overflow ${POOL_OVERFLOW:-0}, timeout ${POOL_TIMEOUT:-5}s)"
 docker compose down -v --remove-orphans >/dev/null 2>&1
-docker compose pull -q open-webui || { log "image pull failed for tag $TAG"; exit 1; }
+if [ -z "${OWUI_IMAGE_LOCAL:-}" ]; then
+  docker compose pull -q open-webui || { log "image pull failed for $IMG"; exit 1; }
+fi
 docker compose up -d || exit 1
 log "Waiting for $URL/health ..."
 for _ in $(seq 1 90); do curl -fsS "$URL/health" >/dev/null 2>&1 && break; sleep 3; done
@@ -55,7 +61,6 @@ curl -fsS "$URL/health" >/dev/null 2>&1 || { log "Open WebUI did not become heal
 VERSION=$(curl -fsS "$URL/api/version" 2>/dev/null)
 log "Open WebUI is up: $VERSION"
 echo "$VERSION" > "$OUT/version.json"
-IMG="ghcr.io/open-webui/open-webui:$TAG"
 REV=$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMG" 2>/dev/null)
 DIGEST=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMG" 2>/dev/null)
 log "Image: $IMG  revision=${REV:-?}  digest=${DIGEST:-?}"
@@ -147,7 +152,7 @@ WS_AFTER=$(awk -F, -v t="$(date -d "$T_TRIG" +%H:%M:%S 2>/dev/null || echo 00:00
 
 {
   echo
-  echo "================ RESULT ($TAG / $MODE) ================"
+  echo "================ RESULT ($LABEL / $MODE) ================"
   echo "version:                  $VERSION"
   echo "image:                    $IMG  revision=${REV:-?}"
   echo "tabs:                     $((USERS*TABS))  (pool size ${POOL_SIZE:-2}, overflow ${POOL_OVERFLOW:-0})"

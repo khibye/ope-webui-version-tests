@@ -42,7 +42,7 @@ services:
       retries: 20
 
   open-webui:
-    image: ghcr.io/open-webui/open-webui:${OWUI_TAG:-v0.13.3}
+    image: ${OWUI_IMAGE:-ghcr.io/open-webui/open-webui:${OWUI_TAG:-v0.13.3}}
     depends_on:
       postgres:
         condition: service_healthy

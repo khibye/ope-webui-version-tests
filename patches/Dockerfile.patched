@@ -1,0 +1,6 @@
+# Layer a patched frontend build and patched backend files onto the official image.
+# Build context: an Open WebUI source tree on which patches/apply_fix.py was applied and `npm run build` was run.
+ARG BASE_IMAGE=ghcr.io/open-webui/open-webui:v0.13.3
+FROM ${BASE_IMAGE}
+COPY build /app/build
+COPY backend/open_webui/socket/main.py /app/backend/open_webui/socket/main.py

@@ -6,6 +6,7 @@
 - [03 - Reproduction results](reports/03-reproduction-results.md) - **reproduced on v0.13.3 and dev** with a 45 s DB stall
 - [04 - Mitigations and operational recommendations](reports/04-mitigations.md)
 - [05 - Draft for the upstream issue](reports/05-issue-draft.md)
+- [06 - Fix verification](reports/06-fix-verification.md) - **the fix removes the loop** (branch `fix/socket-reconnect-storm`, `patches/`)
 - `tools/revoke_sessions.py` - parallel "Sign out all devices" for users active in the last N days (what stopped the incident)
 
 Reproduces, on a laptop, the production incident where losing Redis (or a short DB stall)

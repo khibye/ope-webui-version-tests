@@ -1,0 +1,62 @@
+# 06 - Fix verification
+
+Branch: `fix/socket-reconnect-storm`. Fix: `patches/apply_fix.py` (diff: `patches/socket-reconnect-storm-v0.13.3.diff`).
+Workflow: `.github/workflows/verify-fix.yml` - clones Open WebUI at the ref, applies the fix, rebuilds the frontend,
+layers the build and the patched `socket/main.py` onto the official image, then runs the same reproduction as 03.
+
+Run: https://github.com/khibye/ope-webui-version-tests/actions/runs/43628125107 (2026-11-14)
+
+## Results
+
+Same setup as 03: 20 logged-in tabs, pool size 2 / overflow 0 / timeout 5 s, +100 ms DB latency from the trigger on.
+
+| image | upstream revision | trigger | pool timeouts | socket reconnects after trigger | windows >2 min after trigger with timeouts | verdict |
+|---|---|---|---|---|---|---|
+| **unpatched** v0.13.3 | b0e6098 | PostgreSQL paused 45 s | 347 | 214 | 16 / 16 | loop (03) |
+| **unpatched** dev | 2547992 | PostgreSQL paused 45 s | 602 | 205 | 17 / 17 | loop (03) |
+| **patched** v0.13.3 | b0e6098 | PostgreSQL paused 45 s | **0** | **0** | **0 / 17** | no loop |
+| **patched** dev | fcff231 | PostgreSQL paused 45 s | **0** | **0** | **0 / 17** | no loop |
+| **patched** v0.13.3 | b0e6098 | Redis removed 60 s | 0 | 0 | 0 / 17 | no loop (same as unpatched) |
+| **patched** dev | fcff231 | Redis removed 60 s | 0 | 0 | 0 / 17 | no loop (same as unpatched) |
+
+## Proof that the stall happened and the new code path handled it
+
+During the 45 s pause the periodic re-verification sweep did hit the dead database. With the fix the server logged,
+32 times (v0.13.3) / 34 times (dev):
+
+```
+Could not re-verify socket <sid> because the backend is unavailable (503: Authentication is temporarily unavailable.); keeping the session
+```
+
+and disconnected nothing. No disconnect -> no reconnect -> no sidebar refresh burst -> the pool never saturated:
+0 `QueuePool` errors, 0 new WebSocket connections on the browser side, 0 tracebacks, for the whole 6-minute
+observation. Unpatched, the same trigger produced the first disconnects within 15 s and a loop that was still running
+six minutes later.
+
+## What the fix changes (see 02 for the loop)
+
+Server (`backend/open_webui/socket/main.py`):
+- `is_transient_backend_error()`: SQLAlchemy / Redis / timeout / connection errors and `get_auth()`'s 503 are
+  "could not verify", not "invalid token".
+- `get_socket_session_user()`: on a transient error keep the previously verified session user and retry on the next
+  sweep; disconnect only on a real invalid token.
+- `connect()`: on a transient error refuse the handshake with `ConnectionRefusedError('backend_unavailable', {retry: true})`
+  instead of letting the exception tear down the transport.
+- `user-join`: returns `{error: 'backend_unavailable', retry: true}` instead of failing silently.
+- `periodic_socket_authentication()`: 0-15 s jitter on the 30 s sweep.
+
+Client:
+- `src/routes/+layout.svelte`: reconnect after `io server disconnect` or a refused handshake with exponential backoff
+  and jitter (1 s .. 30 s, reset on successful connect) instead of immediately; retry `user-join` with backoff on
+  `backend_unavailable`.
+- `src/lib/components/layout/Sidebar.svelte`: skip reconnect-triggered full sidebar refreshes that follow each other
+  within 15 s.
+
+## Caveats
+
+- The `dev` test pairs a frontend built from dev HEAD (`fcff231`) with the backend of the official `:dev` image
+  (plus the patched `socket/main.py`); the two may be a few commits apart. The v0.13.3 pair is exact.
+- Keeping a session for up to one sweep interval when the backend is unreachable means a token revoked during an
+  outage stays usable on an already-open socket until the backend is back (at most ~45 s longer than today). HTTP
+  requests are unaffected: they still fail closed.
+- Not tested: multi-worker / multi-pod deployments, `redis-oom` mode against the patched image.

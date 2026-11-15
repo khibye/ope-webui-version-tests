@@ -19,6 +19,19 @@ Same setup as 03: 20 logged-in tabs, pool size 2 / overflow 0 / timeout 5 s, +10
 | **patched** v0.13.3 | b0e6098 | Redis removed 60 s | 0 | 0 | 0 / 17 | no loop (same as unpatched) |
 | **patched** dev | fcff231 | Redis removed 60 s | 0 | 0 | 0 / 17 | no loop (same as unpatched) |
 
+## v0.12.5 (production version), branch `fix/socket-reconnect-storm-v0.12.5`
+
+Run: https://github.com/khibye/ope-webui-version-tests/actions/runs/43699314906 (2026-11-15)
+
+| image | upstream revision | trigger | pool timeouts | socket reconnects after trigger | windows >2 min after trigger with timeouts | verdict |
+|---|---|---|---|---|---|---|
+| **patched** v0.12.5 | f7ac7ee | PostgreSQL paused 45 s | **0** | **0** | **0 / 17** | no loop (30 x "keeping the session") |
+| **patched** v0.12.5 | f7ac7ee | Redis removed 60 s | 0 | 0 | 0 / 17 | no loop; 5 pre-existing heartbeat/Redis DNS tracebacks, same as unpatched |
+
+Published image: `ghcr.io/khibye/ope-webui-version-tests/open-webui:v0.12.5-fix`
+(immutable: `...:v0.12.5-fix-a2ab2922453759c37f82b2d1e274d1205d9817b1`) = official `v0.12.5` + rebuilt frontend +
+patched `backend/open_webui/socket/main.py`. No schema or migration changes; rollback = switch the tag back.
+
 ## Proof that the stall happened and the new code path handled it
 
 During the 45 s pause the periodic re-verification sweep did hit the dead database. With the fix the server logged,

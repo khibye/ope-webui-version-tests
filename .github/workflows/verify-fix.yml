@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         ref: ["v0.12.5"]
-        mode: ["db-stall", "redis"]
+        mode: ["db-stall", "redis", "revoke"]
     steps:
       - uses: actions/checkout@v4
 
@@ -90,3 +90,29 @@ jobs:
           path: |
             results/
             fix-${{ matrix.ref }}.diff
+
+  unpatched-revoke:
+    name: "unpatched (v0.12.5, revoke) - control"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          python3 -m playwright install --with-deps chromium
+      - name: Run the revoke scenario against the official image
+        run: |
+          chmod +x run_check.sh
+          ./run_check.sh v0.12.5 revoke
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-unpatched-v0.12.5-revoke
+          path: results/

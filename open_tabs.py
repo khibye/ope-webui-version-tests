@@ -139,6 +139,15 @@ def main():
                 f.flush()
                 print(" ".join(f"{str(v):>9s}" for v in row), flush=True)
 
+        # Final state of the tabs (used by the revoke mode: tabs with revoked tokens must end on the login page)
+        on_auth = 0
+        for pg in pages:
+            try:
+                info = pg.evaluate("() => ({url: location.pathname, login: !!document.querySelector('input[type=password]')})")
+                on_auth += info["url"].startswith("/auth") or info["login"]
+            except Exception:
+                pass
+        print(f"DIAG_END tabs={len(pages)} on_login_page={on_auth}", flush=True)
         browser.close()
     print("Tabs closed.")
 

@@ -1,5 +1,5 @@
 diff --git a/backend/open_webui/socket/main.py b/backend/open_webui/socket/main.py
-index 1338308..79bb5f5 100644
+index 1338308..63856f8 100644
 --- a/backend/open_webui/socket/main.py
 +++ b/backend/open_webui/socket/main.py
 @@ -66,7 +66,10 @@ from open_webui.utils.redis import (
@@ -77,7 +77,7 @@ index 1338308..79bb5f5 100644
      LOCAL_AUTHENTICATED_SIDS.discard(sid)
      if wait_for_disconnect:
          await sio.disconnect(sid)
-@@ -614,7 +652,15 @@ async def connect(sid, environ, auth):
+@@ -614,7 +652,22 @@ async def connect(sid, environ, auth):
          scope = (environ or {}).get('asgi.scope') or {}
          fastapi_app = scope.get('app')
          redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
@@ -91,10 +91,17 @@ index 1338308..79bb5f5 100644
 +            # transport. The client sees a connect_error carrying this data and retries with backoff.
 +            log.warning('Refusing socket %s: backend unavailable during token verification (%s)', sid, e)
 +            raise SocketConnectionRefusedError('backend_unavailable', {'retry': True}) from None
++
++        if user is None and auth['token']:
++            # The token was supplied but is invalid (expired or revoked). Refuse the handshake instead of
++            # accepting an anonymous socket that every heartbeat would then disconnect, which makes the
++            # client reconnect and re-fetch the whole sidebar in a loop (a 401 storm after a mass revoke).
++            log.debug('Refusing socket %s: invalid token', sid)
++            raise SocketConnectionRefusedError('unauthorized')
  
          if user:
              socket_user = {
-@@ -645,7 +691,13 @@ async def user_join(sid, data):
+@@ -645,7 +698,13 @@ async def user_join(sid, data):
      scope = environ.get('asgi.scope') or {}
      fastapi_app = scope.get('app')
      redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
@@ -109,6 +116,21 @@ index 1338308..79bb5f5 100644
      if not user:
          return
  
+@@ -722,6 +781,14 @@ async def refresh_chat_access(chat_id=None):
+ 
+ @sio.on('heartbeat')
+ async def heartbeat(sid, data):
++    try:
++        session = await sio.get_session(sid)
++    except Exception:
++        session = None
++    if not session or not session.get('user'):
++        # Anonymous socket (login page, or a token that was never accepted): nothing to refresh, and
++        # disconnecting it would only make the client reconnect and re-fetch everything.
++        return
+     user = await get_socket_session_user(sid)
+     if user:
+         SESSION_POOL[sid] = {
 diff --git a/src/lib/components/layout/Sidebar.svelte b/src/lib/components/layout/Sidebar.svelte
 index 3ddd1ae..9404f78 100644
 --- a/src/lib/components/layout/Sidebar.svelte
@@ -131,10 +153,10 @@ index 3ddd1ae..9404f78 100644
  		if (result.accepted) {
  			await initFolders();
 diff --git a/src/routes/+layout.svelte b/src/routes/+layout.svelte
-index aaf4851..0568c3e 100644
+index aaf4851..0285322 100644
 --- a/src/routes/+layout.svelte
 +++ b/src/routes/+layout.svelte
-@@ -188,14 +188,46 @@
+@@ -188,14 +188,56 @@
  		});
  		await socket.set(_socket);
  
@@ -162,6 +184,16 @@ index aaf4851..0568c3e 100644
 +
  		_socket.on('connect_error', (err) => {
  			console.log('connect_error', err);
++			if (err?.message === 'unauthorized') {
++				// The server refused our token (expired or revoked). Sign out right here instead of relying on a
++				// later 401 + confirmation request, which fails under load and leaves the tab looping.
++				console.log('Socket refused: session is no longer valid, signing out');
++				clearExpiredSession();
++				// `auth` re-reads localStorage.token, which is now gone: the next connect is anonymous and
++				// accepted, so the login page still has a socket to emit user-join on after signing in.
++				scheduleReconnect('unauthorized');
++				return;
++			}
 +			// `active` is false when the server refused the handshake (e.g. backend temporarily unavailable):
 +			// socket.io does not retry those on its own, so retry here with backoff.
 +			if (!_socket.active) {
@@ -181,7 +213,7 @@ index aaf4851..0568c3e 100644
  
  			// Cancel any pending disconnect toast if we reconnected quickly
  			clearDisconnectToastTimer();
-@@ -251,7 +283,17 @@
+@@ -251,7 +293,17 @@
  
  			if (localStorage.getItem('token')) {
  				// Emit user-join event with auth token
@@ -200,7 +232,7 @@ index aaf4851..0568c3e 100644
  			} else {
  				console.warn('No token found in localStorage, user-join event not emitted');
  			}
-@@ -284,7 +326,7 @@
+@@ -284,7 +336,7 @@
  			}
  
  			if (reason === 'io server disconnect') {

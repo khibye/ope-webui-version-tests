@@ -117,6 +117,16 @@ case "$MODE" in
     docker compose unpause postgres
     log "PostgreSQL unpaused"
     ;;
+  revoke)
+    log "TRIGGER: admin revokes the sessions of every other user (their open tabs now hold invalid tokens)"
+    ADMIN_TOKEN=$(python3 -c "import json;print(json.load(open('$OUT/tokens.json'))[0]['token'])")
+    ADMIN_ID=$(curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$URL/api/v1/auths/" | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")
+    curl -fsS -H "Authorization: Bearer $ADMIN_TOKEN" "$URL/api/v1/users/all" \
+      | python3 -c "import json,sys;[print(u['id']) for u in json.load(sys.stdin)['users'] if u['id']!='$ADMIN_ID']" \
+      | while read -r uid; do
+          curl -s -o /dev/null -w "revoke $uid -> %{http_code}\n" -X POST -H "Authorization: Bearer $ADMIN_TOKEN" "$URL/api/v1/users/$uid/sessions/revoke" | tee -a "$OUT/run.log"
+        done
+    ;;
   *) log "unknown mode '$MODE'"; kill "$TABS_PID" 2>/dev/null; exit 1 ;;
 esac
 
@@ -160,7 +170,21 @@ WS_AFTER=$(awk -F, -v t="$(date -d "$T_TRIG" +%H:%M:%S 2>/dev/null || echo 00:00
   echo "'Session not found':      $TOTAL_SNF"
   echo "websocket reconnects after trigger (all tabs): $WS_AFTER"
   echo "observation windows >2 min after trigger with pool timeouts: $LATE_TIMEOUTS / $LATE_WINDOWS"
-  if [ "$LATE_WINDOWS" -gt 0 ] && [ "$LATE_TIMEOUTS" -ge $((LATE_WINDOWS / 2)) ] && [ "$WS_AFTER" -gt $((USERS*TABS*3)) ]; then
+  if [ "$MODE" = "revoke" ]; then
+    # Last 12 browser windows (2 min): a fixed client has signed out and stopped; a looping one keeps producing 401s
+    LATE_401=$(tail -n 12 "$OUT/tabs_stats.csv" | awk -F, '{s+=$7} END{print s+0}')
+    LATE_WS=$(tail -n 12 "$OUT/tabs_stats.csv" | awk -F, '{s+=$2} END{print s+0}')
+    TOTAL_401=$(awk -F, 'NR>1{s+=$7} END{print s+0}' "$OUT/tabs_stats.csv")
+    END_DIAG=$(grep -m1 '^DIAG_END' "$OUT/tabs.log")
+    echo "401 responses total / in the last 2 min: $TOTAL_401 / $LATE_401"
+    echo "websocket reconnects in the last 2 min:  $LATE_WS"
+    echo "$END_DIAG   (expected on_login_page = $((USERS*TABS - TABS)): every tab except the admin's)"
+    if [ "$LATE_401" -eq 0 ] && [ "$LATE_WS" -le 2 ]; then
+      echo "VERDICT: FIXED - tabs with revoked tokens signed out and went quiet."
+    else
+      echo "VERDICT: LOOPING - tabs with revoked tokens are still producing 401s / reconnects."
+    fi
+  elif [ "$LATE_WINDOWS" -gt 0 ] && [ "$LATE_TIMEOUTS" -ge $((LATE_WINDOWS / 2)) ] && [ "$WS_AFTER" -gt $((USERS*TABS*3)) ]; then
     echo "VERDICT: REPRODUCED - pool timeouts and reconnects continued long after the trigger ended (self-sustaining loop)."
   elif [ "$TOTAL_TIMEOUTS" -gt "$BASE_TIMEOUTS" ]; then
     echo "VERDICT: PARTIAL - the trigger caused pool timeouts, but the system recovered within ~2 min."

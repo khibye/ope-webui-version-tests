@@ -128,7 +128,29 @@ def is_transient_backend_error(exc: BaseException) -> bool:
         "            # transport. The client sees a connect_error carrying this data and retries with backoff.\n"
         "            log.warning('Refusing socket %s: backend unavailable during token verification (%s)', sid, e)\n"
         "            raise SocketConnectionRefusedError('backend_unavailable', {'retry': True}) from None\n\n"
+        "        if user is None and auth['token']:\n"
+        "            # The token was supplied but is invalid (expired or revoked). Refuse the handshake instead of\n"
+        "            # accepting an anonymous socket that every heartbeat would then disconnect, which makes the\n"
+        "            # client reconnect and re-fetch the whole sidebar in a loop (a 401 storm after a mass revoke).\n"
+        "            log.debug('Refusing socket %s: invalid token', sid)\n"
+        "            raise SocketConnectionRefusedError('unauthorized')\n\n"
         "        if user:\n",
+    )
+
+    # --- server: never disconnect an anonymous socket because of a heartbeat
+    edit(
+        server,
+        "@sio.on('heartbeat')\nasync def heartbeat(sid, data):\n    user = await get_socket_session_user(sid)\n",
+        "@sio.on('heartbeat')\nasync def heartbeat(sid, data):\n"
+        "    try:\n"
+        "        session = await sio.get_session(sid)\n"
+        "    except Exception:\n"
+        "        session = None\n"
+        "    if not session or not session.get('user'):\n"
+        "        # Anonymous socket (login page, or a token that was never accepted): nothing to refresh, and\n"
+        "        # disconnecting it would only make the client reconnect and re-fetch everything.\n"
+        "        return\n"
+        "    user = await get_socket_session_user(sid)\n",
     )
     # user-join only (join_channel / join_note contain the same lines and are left as they are)
     s = server.read_text()
@@ -189,6 +211,16 @@ def is_transient_backend_error(exc: BaseException) -> bool:
         "\t\t};\n\n"
         "\t\t_socket.on('connect_error', (err) => {\n"
         "\t\t\tconsole.log('connect_error', err);\n"
+        "\t\t\tif (err?.message === 'unauthorized') {\n"
+        "\t\t\t\t// The server refused our token (expired or revoked). Sign out right here instead of relying on a\n"
+        "\t\t\t\t// later 401 + confirmation request, which fails under load and leaves the tab looping.\n"
+        "\t\t\t\tconsole.log('Socket refused: session is no longer valid, signing out');\n"
+        "\t\t\t\tclearExpiredSession();\n"
+        "\t\t\t\t// `auth` re-reads localStorage.token, which is now gone: the next connect is anonymous and\n"
+        "\t\t\t\t// accepted, so the login page still has a socket to emit user-join on after signing in.\n"
+        "\t\t\t\tscheduleReconnect('unauthorized');\n"
+        "\t\t\t\treturn;\n"
+        "\t\t\t}\n"
         "\t\t\t// `active` is false when the server refused the handshake (e.g. backend temporarily unavailable):\n"
         "\t\t\t// socket.io does not retry those on its own, so retry here with backoff.\n"
         "\t\t\tif (!_socket.active) {\n"

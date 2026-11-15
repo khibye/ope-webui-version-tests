@@ -238,6 +238,19 @@ def is_transient_backend_error(exc: BaseException) -> bool:
     )
     edit(
         layout,
+        "\t\twindow.addEventListener('message', windowMessageEventHandler);\n",
+        "\t\twindow.addEventListener('message', windowMessageEventHandler);\n"
+        "\t\t// When another tab of this user signs out (token removed from localStorage), follow it instead of\n"
+        "\t\t// lingering with a stale session and an anonymous socket.\n"
+        "\t\twindow.addEventListener('storage', (e) => {\n"
+        "\t\t\tif (e.key === 'token' && !e.newValue && $user) {\n"
+        "\t\t\t\tconsole.log('Token removed by another tab, signing out');\n"
+        "\t\t\t\tclearExpiredSession();\n"
+        "\t\t\t}\n"
+        "\t\t});\n",
+    )
+    edit(
+        layout,
         "\t\t\tif (reason === 'io server disconnect') {\n\t\t\t\t_socket.connect();\n\t\t\t}\n",
         "\t\t\tif (reason === 'io server disconnect') {\n\t\t\t\tscheduleReconnect('server disconnect');\n\t\t\t}\n",
     )

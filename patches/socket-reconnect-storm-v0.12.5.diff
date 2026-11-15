@@ -153,7 +153,7 @@ index 3ddd1ae..9404f78 100644
  		if (result.accepted) {
  			await initFolders();
 diff --git a/src/routes/+layout.svelte b/src/routes/+layout.svelte
-index aaf4851..0285322 100644
+index aaf4851..8c07498 100644
 --- a/src/routes/+layout.svelte
 +++ b/src/routes/+layout.svelte
 @@ -188,14 +188,56 @@
@@ -241,3 +241,18 @@ index aaf4851..0285322 100644
  			}
  
  			if (details) {
+@@ -1166,6 +1218,14 @@
+ 		};
+ 
+ 		window.addEventListener('message', windowMessageEventHandler);
++		// When another tab of this user signs out (token removed from localStorage), follow it instead of
++		// lingering with a stale session and an anonymous socket.
++		window.addEventListener('storage', (e) => {
++			if (e.key === 'token' && !e.newValue && $user) {
++				console.log('Token removed by another tab, signing out');
++				clearExpiredSession();
++			}
++		});
+ 
+ 		let touchstartY = 0;
+ 

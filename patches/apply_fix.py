@@ -4,7 +4,7 @@ Apply the socket reconnect-storm fix to an Open WebUI source tree.
 
     python3 apply_fix.py /path/to/open-webui
 
-Works on v0.13.3 and on dev (2026-11-12). Every edit is anchored on exact text and the script fails loudly if an
+Works on v0.12.5, v0.13.3 and dev (2026-11-12). Every edit is anchored on exact text and the script fails loudly if an
 anchor is missing, so it never half-applies. See ../reports/02-code-analysis.md for why each change exists.
 """
 import sys
@@ -38,12 +38,11 @@ def main():
         "from starlette.exceptions import HTTPException as StarletteHTTPException\n",
     )
 
-    s = server.read_text()
-    start = s.index("LOCAL_AUTHENTICATED_SIDS: set[str] = set()\n")
-    end = s.index("encryption = Relay(sio, get_socket_session_user, REDIS)")
-    block = s[start:end]
-    assert "async def periodic_socket_authentication" in block and "async def get_socket_session_user" in block
-    new_block = '''LOCAL_AUTHENTICATED_SIDS: set[str] = set()
+    # Helper + constants, right after the LOCAL_AUTHENTICATED_SIDS declaration
+    edit(
+        server,
+        "LOCAL_AUTHENTICATED_SIDS: set[str] = set()\n",
+        '''LOCAL_AUTHENTICATED_SIDS: set[str] = set()
 
 # Errors that mean "the backend could not answer right now", as opposed to "the token is invalid".
 # A socket must never be disconnected because of one of these: disconnecting makes every client reconnect
@@ -59,25 +58,23 @@ def is_transient_backend_error(exc: BaseException) -> bool:
         # get_auth() maps database errors to 503 ("Authentication is temporarily unavailable.")
         return exc.status_code in (502, 503, 504)
     return isinstance(exc, TRANSIENT_BACKEND_ERRORS)
+''',
+    )
 
+    # Jitter on the periodic sweep (the rest of that function is version-specific and left untouched)
+    edit(
+        server,
+        "async def periodic_socket_authentication():\n    while True:\n        await asyncio.sleep(30)\n",
+        "async def periodic_socket_authentication():\n    while True:\n"
+        "        # Jitter so that workers do not all hit the database in the same second.\n"
+        "        await asyncio.sleep(SOCKET_REAUTH_INTERVAL + random.uniform(0, SOCKET_REAUTH_JITTER))\n",
+    )
 
-async def periodic_socket_authentication():
-    while True:
-        # Jitter so that workers do not all hit the database in the same second.
-        await asyncio.sleep(SOCKET_REAUTH_INTERVAL + random.uniform(0, SOCKET_REAUTH_JITTER))
-        await encryption.sweep()
-        for sid in tuple(LOCAL_AUTHENTICATED_SIDS):
-            session_user = await get_socket_session_user(sid)
-            if session_user:
-                from open_webui.socket.comments import revalidate_comment_subscription
-
-                try:
-                    await revalidate_comment_subscription(sio, sid, session_user)
-                except Exception:
-                    log.exception('Could not revalidate comment subscription')
-
-
-async def get_socket_session_user(sid: str, *, wait_for_disconnect: bool = True) -> dict | None:
+    # Replace get_socket_session_user() entirely (identical in v0.12.5, v0.13.3 and dev)
+    s = server.read_text()
+    start = s.index("async def get_socket_session_user(")
+    end = s.index("encryption = Relay(sio, get_socket_session_user, REDIS)")
+    new_block = '''async def get_socket_session_user(sid: str, *, wait_for_disconnect: bool = True) -> dict | None:
     """Session user from this worker's local Socket.IO store; only locally connected sids are ever looked up.
 
     Disconnects the socket only when the token is actually invalid. If the backend cannot be reached to

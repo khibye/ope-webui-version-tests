@@ -1,0 +1,211 @@
+diff --git a/backend/open_webui/socket/main.py b/backend/open_webui/socket/main.py
+index 1338308..79bb5f5 100644
+--- a/backend/open_webui/socket/main.py
++++ b/backend/open_webui/socket/main.py
+@@ -66,7 +66,10 @@ from open_webui.utils.redis import (
+     get_sentinels_from_env,
+ )
+ from redis.exceptions import RedisError
++from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefusedError
+ from socketio.packet import Packet
++from sqlalchemy.exc import SQLAlchemyError
++from starlette.exceptions import HTTPException as StarletteHTTPException
+ 
+ logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
+ log = logging.getLogger(__name__)
+@@ -457,23 +460,58 @@ def get_user_id_from_session_pool(sid):
+ 
+ LOCAL_AUTHENTICATED_SIDS: set[str] = set()
+ 
++# Errors that mean "the backend could not answer right now", as opposed to "the token is invalid".
++# A socket must never be disconnected because of one of these: disconnecting makes every client reconnect
++# at once, each reconnect needs the same backend to verify its token, and the resulting load keeps the
++# backend unavailable (self-sustaining reconnect storm).
++TRANSIENT_BACKEND_ERRORS = (SQLAlchemyError, RedisError, asyncio.TimeoutError, TimeoutError, ConnectionError)
++SOCKET_REAUTH_INTERVAL = 30
++SOCKET_REAUTH_JITTER = 15
++
++
++def is_transient_backend_error(exc: BaseException) -> bool:
++    if isinstance(exc, StarletteHTTPException):
++        # get_auth() maps database errors to 503 ("Authentication is temporarily unavailable.")
++        return exc.status_code in (502, 503, 504)
++    return isinstance(exc, TRANSIENT_BACKEND_ERRORS)
++
+ 
+ async def periodic_socket_authentication():
+     while True:
+-        await asyncio.sleep(30)
++        # Jitter so that workers do not all hit the database in the same second.
++        await asyncio.sleep(SOCKET_REAUTH_INTERVAL + random.uniform(0, SOCKET_REAUTH_JITTER))
+         await encryption.sweep()
+         for sid in tuple(LOCAL_AUTHENTICATED_SIDS):
+             await get_socket_session_user(sid)
+ 
+ 
+ async def get_socket_session_user(sid: str, *, wait_for_disconnect: bool = True) -> dict | None:
+-    """Session user from this worker's local Socket.IO store; only locally connected sids are ever looked up."""
++    """Session user from this worker's local Socket.IO store; only locally connected sids are ever looked up.
++
++    Disconnects the socket only when the token is actually invalid. If the backend cannot be reached to
++    re-verify it, the previously verified session user is kept and the check is retried on the next sweep.
++    """
++    session = None
+     try:
+         session = await sio.get_session(sid)
+-        if session.get('user') and await get_verified_user_by_token(session.get('token', ''), REDIS):
+-            return session['user']
+     except Exception:
+-        log.debug('Socket authentication expired for %s', sid)
++        log.debug('No local session for %s', sid)
++
++    if session and session.get('user'):
++        try:
++            if await get_verified_user_by_token(session.get('token', ''), REDIS):
++                return session['user']
++            log.debug('Socket authentication expired for %s', sid)
++        except Exception as e:
++            if is_transient_backend_error(e):
++                log.warning(
++                    'Could not re-verify socket %s because the backend is unavailable (%s); keeping the session',
++                    sid,
++                    e,
++                )
++                return session['user']
++            log.debug('Socket authentication check failed for %s', sid, exc_info=True)
++
+     LOCAL_AUTHENTICATED_SIDS.discard(sid)
+     if wait_for_disconnect:
+         await sio.disconnect(sid)
+@@ -614,7 +652,15 @@ async def connect(sid, environ, auth):
+         scope = (environ or {}).get('asgi.scope') or {}
+         fastapi_app = scope.get('app')
+         redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
+-        user = await get_verified_user_by_token(auth['token'], redis)
++        try:
++            user = await get_verified_user_by_token(auth['token'], redis)
++        except Exception as e:
++            if not is_transient_backend_error(e):
++                raise
++            # Refuse the handshake with an explicit reason instead of letting the exception tear down the
++            # transport. The client sees a connect_error carrying this data and retries with backoff.
++            log.warning('Refusing socket %s: backend unavailable during token verification (%s)', sid, e)
++            raise SocketConnectionRefusedError('backend_unavailable', {'retry': True}) from None
+ 
+         if user:
+             socket_user = {
+@@ -645,7 +691,13 @@ async def user_join(sid, data):
+     scope = environ.get('asgi.scope') or {}
+     fastapi_app = scope.get('app')
+     redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
+-    user = await get_verified_user_by_token(auth['token'], redis)
++    try:
++        user = await get_verified_user_by_token(auth['token'], redis)
++    except Exception as e:
++        if not is_transient_backend_error(e):
++            raise
++        log.warning('user-join for %s could not be verified: backend unavailable (%s)', sid, e)
++        return {'error': 'backend_unavailable', 'retry': True}
+     if not user:
+         return
+ 
+diff --git a/src/lib/components/layout/Sidebar.svelte b/src/lib/components/layout/Sidebar.svelte
+index 3ddd1ae..9404f78 100644
+--- a/src/lib/components/layout/Sidebar.svelte
++++ b/src/lib/components/layout/Sidebar.svelte
+@@ -530,7 +530,16 @@
+ 		await initChatList();
+ 	};
+ 
++	// Each socket reconnect re-fetches the chat list, pinned chats and folders. During a reconnect storm that
++	// is several DB-backed requests per tab per reconnect, so skip refreshes that follow each other closely.
++	const RECONNECT_REFRESH_MIN_INTERVAL_MS = 15000;
++	let lastChatRowsRefreshAt = 0;
+ 	const refreshChatRows = async () => {
++		const now = Date.now();
++		if (chatListReady && now - lastChatRowsRefreshAt < RECONNECT_REFRESH_MIN_INTERVAL_MS) {
++			return;
++		}
++		lastChatRowsRefreshAt = now;
+ 		const result = await refreshChatList(localStorage.token, { refreshPinned: true });
+ 		if (result.accepted) {
+ 			await initFolders();
+diff --git a/src/routes/+layout.svelte b/src/routes/+layout.svelte
+index aaf4851..0568c3e 100644
+--- a/src/routes/+layout.svelte
++++ b/src/routes/+layout.svelte
+@@ -188,14 +188,46 @@
+ 		});
+ 		await socket.set(_socket);
+ 
++		// Reconnect with exponential backoff and jitter instead of immediately. An immediate reconnect from
++		// thousands of tabs at once is what turns a short backend hiccup into a self-sustaining storm.
++		let reconnectAttempt = 0;
++		let reconnectTimer = null;
++		const RECONNECT_BASE_MS = 1000;
++		const RECONNECT_MAX_MS = 30000;
++		const scheduleReconnect = (why) => {
++			if (reconnectTimer || _socket.connected) {
++				return;
++			}
++			const base = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** reconnectAttempt);
++			const delay = Math.round(base * (0.5 + Math.random())); // 50%..150% of base
++			reconnectAttempt += 1;
++			console.log(`Socket reconnect (${why}) in ${delay}ms, attempt ${reconnectAttempt}`);
++			reconnectTimer = setTimeout(() => {
++				reconnectTimer = null;
++				if (!_socket.connected) {
++					_socket.connect();
++				}
++			}, delay);
++		};
++
+ 		_socket.on('connect_error', (err) => {
+ 			console.log('connect_error', err);
++			// `active` is false when the server refused the handshake (e.g. backend temporarily unavailable):
++			// socket.io does not retry those on its own, so retry here with backoff.
++			if (!_socket.active) {
++				scheduleReconnect('connect_error');
++			}
+ 		});
+ 
+ 		let hasConnectedOnce = false;
+ 
+ 		_socket.on('connect', async () => {
+ 			console.log('connected', _socket.id);
++			reconnectAttempt = 0;
++			if (reconnectTimer) {
++				clearTimeout(reconnectTimer);
++				reconnectTimer = null;
++			}
+ 
+ 			// Cancel any pending disconnect toast if we reconnected quickly
+ 			clearDisconnectToastTimer();
+@@ -251,7 +283,17 @@
+ 
+ 			if (localStorage.getItem('token')) {
+ 				// Emit user-join event with auth token
+-				_socket.emit('user-join', { auth: { token: localStorage.token } });
++				// Retry later if the backend could not verify the token right now
++				const emitUserJoin = (attempt = 0) => {
++					_socket.emit('user-join', { auth: { token: localStorage.token } }, (res) => {
++						if (res?.error === 'backend_unavailable' && res?.retry && attempt < 6 && _socket.connected) {
++							const delay = Math.round(Math.min(30000, 2000 * 2 ** attempt) * (0.5 + Math.random()));
++							console.log(`user-join deferred by server, retrying in ${delay}ms`);
++							setTimeout(() => emitUserJoin(attempt + 1), delay);
++						}
++					});
++				};
++				emitUserJoin();
+ 			} else {
+ 				console.warn('No token found in localStorage, user-join event not emitted');
+ 			}
+@@ -284,7 +326,7 @@
+ 			}
+ 
+ 			if (reason === 'io server disconnect') {
+-				_socket.connect();
++				scheduleReconnect('server disconnect');
+ 			}
+ 
+ 			if (details) {

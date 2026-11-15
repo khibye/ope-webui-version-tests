@@ -1,4 +1,5 @@
 name: Verify fix (patched image vs unpatched)
+# Branch fix/socket-reconnect-storm-v0.12.5: production version only, and the patched image is pushed to GHCR.
 
 on:
   workflow_dispatch:
@@ -8,10 +9,13 @@ jobs:
     name: "patched (${{ matrix.ref }}, ${{ matrix.mode }})"
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
-        ref: ["v0.13.3", "dev"]
+        ref: ["v0.12.5"]
         mode: ["db-stall", "redis"]
     steps:
       - uses: actions/checkout@v4
@@ -45,6 +49,18 @@ jobs:
           docker build -f patches/Dockerfile.patched \
             --build-arg BASE_IMAGE=ghcr.io/open-webui/open-webui:${{ matrix.ref }} \
             -t owui-patched:${{ matrix.ref }} upstream
+
+      - name: Push patched image to GHCR (only from the db-stall job, to push once)
+        if: matrix.mode == 'db-stall'
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}/open-webui
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker tag owui-patched:${{ matrix.ref }} "$IMAGE:${{ matrix.ref }}-fix"
+          docker tag owui-patched:${{ matrix.ref }} "$IMAGE:${{ matrix.ref }}-fix-${{ github.sha }}"
+          docker push "$IMAGE:${{ matrix.ref }}-fix"
+          docker push "$IMAGE:${{ matrix.ref }}-fix-${{ github.sha }}"
+          echo "Pushed $IMAGE:${{ matrix.ref }}-fix and $IMAGE:${{ matrix.ref }}-fix-${{ github.sha }}"
 
       - uses: actions/setup-python@v5
         with:

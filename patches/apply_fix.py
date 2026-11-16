@@ -31,6 +31,7 @@ def main():
     edit(
         server,
         "from redis.exceptions import RedisError\nfrom socketio.packet import Packet\n",
+        "import os\n"
         "from redis.exceptions import RedisError\n"
         "from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefusedError\n"
         "from socketio.packet import Packet\n"
@@ -49,8 +50,14 @@ def main():
 # at once, each reconnect needs the same backend to verify its token, and the resulting load keeps the
 # backend unavailable (self-sustaining reconnect storm).
 TRANSIENT_BACKEND_ERRORS = (SQLAlchemyError, RedisError, asyncio.TimeoutError, TimeoutError, ConnectionError)
-SOCKET_REAUTH_INTERVAL = 30
+SOCKET_REAUTH_INTERVAL = max(int(os.getenv('SOCKET_REAUTH_INTERVAL', '30')), 10)
 SOCKET_REAUTH_JITTER = 15
+# A single re-verification must not wait DATABASE_POOL_TIMEOUT for a connection: a sweep over hundreds of sockets
+# with a saturated pool would then run for hours. After this many seconds the check counts as "could not verify".
+SOCKET_REAUTH_CHECK_TIMEOUT = max(float(os.getenv('SOCKET_REAUTH_CHECK_TIMEOUT', '5')), 1.0)
+# Heartbeats arrive every 30 s per socket; writing user.last_active_at on each one is one UPDATE + commit per socket
+# per 30 s. Write it at most this often per socket instead.
+HEARTBEAT_LAST_ACTIVE_WRITE_INTERVAL = max(int(os.getenv('HEARTBEAT_LAST_ACTIVE_WRITE_INTERVAL', '300')), 30)
 
 
 def is_transient_backend_error(exc: BaseException) -> bool:
@@ -67,7 +74,36 @@ def is_transient_backend_error(exc: BaseException) -> bool:
         "async def periodic_socket_authentication():\n    while True:\n        await asyncio.sleep(30)\n",
         "async def periodic_socket_authentication():\n    while True:\n"
         "        # Jitter so that workers do not all hit the database in the same second.\n"
-        "        await asyncio.sleep(SOCKET_REAUTH_INTERVAL + random.uniform(0, SOCKET_REAUTH_JITTER))\n",
+        "        await asyncio.sleep(SOCKET_REAUTH_INTERVAL + random.uniform(0, SOCKET_REAUTH_JITTER))\n"
+        "        sweep_started = time.monotonic()\n",
+    )
+    edit(
+        server,
+        "        for sid in tuple(LOCAL_AUTHENTICATED_SIDS):\n"
+        "            session_user = await get_socket_session_user(sid)\n"
+        if "session_user = await get_socket_session_user(sid)" in server.read_text()
+        else "        for sid in tuple(LOCAL_AUTHENTICATED_SIDS):\n            await get_socket_session_user(sid)\n",
+        (
+            "        for i, sid in enumerate(tuple(LOCAL_AUTHENTICATED_SIDS)):\n"
+            "            if i % 50 == 49:\n"
+            "                await asyncio.sleep(0)  # let heartbeats and requests run between checks\n"
+            "            session_user = await get_socket_session_user(sid)\n"
+            if "session_user = await get_socket_session_user(sid)" in server.read_text()
+            else
+            "        for i, sid in enumerate(tuple(LOCAL_AUTHENTICATED_SIDS)):\n"
+            "            if i % 50 == 49:\n"
+            "                await asyncio.sleep(0)  # let heartbeats and requests run between checks\n"
+            "            await get_socket_session_user(sid)\n"
+        ),
+    )
+    edit(
+        server,
+        "\n\nasync def get_socket_session_user(",
+        "\n        sweep_took = time.monotonic() - sweep_started\n"
+        "        if sweep_took > SOCKET_REAUTH_INTERVAL:\n"
+        "            log.warning('Socket re-verification sweep took %.0fs for %d sockets (interval %ds)',\n"
+        "                        sweep_took, len(LOCAL_AUTHENTICATED_SIDS), SOCKET_REAUTH_INTERVAL)\n"
+        "\n\nasync def get_socket_session_user(",
     )
 
     # Replace get_socket_session_user() entirely (identical in v0.12.5, v0.13.3 and dev)
@@ -88,7 +124,9 @@ def is_transient_backend_error(exc: BaseException) -> bool:
 
     if session and session.get('user'):
         try:
-            if await get_verified_user_by_token(session.get('token', ''), REDIS):
+            if await asyncio.wait_for(
+                get_verified_user_by_token(session.get('token', ''), REDIS), timeout=SOCKET_REAUTH_CHECK_TIMEOUT
+            ):
                 return session['user']
             log.debug('Socket authentication expired for %s', sid)
         except Exception as e:
@@ -137,21 +175,45 @@ def is_transient_backend_error(exc: BaseException) -> bool:
         "        if user:\n",
     )
 
-    # --- server: never disconnect an anonymous socket because of a heartbeat
-    edit(
-        server,
-        "@sio.on('heartbeat')\nasync def heartbeat(sid, data):\n    user = await get_socket_session_user(sid)\n",
-        "@sio.on('heartbeat')\nasync def heartbeat(sid, data):\n"
-        "    try:\n"
-        "        session = await sio.get_session(sid)\n"
-        "    except Exception:\n"
-        "        session = None\n"
-        "    if not session or not session.get('user'):\n"
-        "        # Anonymous socket (login page, or a token that was never accepted): nothing to refresh, and\n"
-        "        # disconnecting it would only make the client reconnect and re-fetch everything.\n"
-        "        return\n"
-        "    user = await get_socket_session_user(sid)\n",
-    )
+    # --- server: cheap heartbeat. The periodic sweep already re-verifies every socket against the database, so a
+    # heartbeat only refreshes last_seen in Redis and writes user.last_active_at every few minutes instead of
+    # (JWT decode + 2 DB reads + 1 DB write + commit) per socket per 30 s.
+    s = server.read_text()
+    hb_start = s.index("@sio.on('heartbeat')\nasync def heartbeat(sid, data):\n")
+    hb_end = s.index("\n\n@sio.on(", hb_start)
+    hb_old = s[hb_start:hb_end]
+    if "await Users.update_last_active_by_id(user['id'])" not in hb_old:
+        sys.exit("heartbeat handler looks different than expected")
+    hb_new = '''@sio.on('heartbeat')
+async def heartbeat(sid, data):
+    try:
+        session = await sio.get_session(sid)
+    except Exception:
+        session = None
+    if not session or not session.get('user'):
+        # Anonymous socket (login page): nothing to refresh, and disconnecting it would only make the client
+        # reconnect and re-fetch everything.
+        return
+    user = session['user']
+    now = int(time.time())
+    try:
+        SESSION_POOL[sid] = {
+            **(SESSION_POOL.get(sid) or {}),
+            **user,
+            'last_seen_at': now,
+        }
+    except Exception as e:
+        log.debug('heartbeat: could not refresh session pool for %s: %s', sid, e)
+    if now - session.get('last_active_written_at', 0) >= HEARTBEAT_LAST_ACTIVE_WRITE_INTERVAL:
+        try:
+            await Users.update_last_active_by_id(user['id'])
+            session['last_active_written_at'] = now
+            await sio.save_session(sid, session)
+        except Exception as e:
+            if not is_transient_backend_error(e):
+                raise
+            log.debug('heartbeat: could not update last_active_at for %s: %s', sid, e)'''
+    server.write_text(s[:hb_start] + hb_new + s[hb_end:])
     # user-join only (join_channel / join_note contain the same lines and are left as they are)
     s = server.read_text()
     fn_start = s.index("async def user_join(sid, data):")

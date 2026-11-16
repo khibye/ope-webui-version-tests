@@ -1,10 +1,12 @@
 diff --git a/backend/open_webui/socket/main.py b/backend/open_webui/socket/main.py
-index 1338308..63856f8 100644
+index 1338308f..451974a3 100644
 --- a/backend/open_webui/socket/main.py
 +++ b/backend/open_webui/socket/main.py
-@@ -66,7 +66,10 @@ from open_webui.utils.redis import (
+@@ -65,8 +65,12 @@ from open_webui.utils.redis import (
+     get_redis_connection,
      get_sentinels_from_env,
  )
++import os
  from redis.exceptions import RedisError
 +from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefusedError
  from socketio.packet import Packet
@@ -13,7 +15,7 @@ index 1338308..63856f8 100644
  
  logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
  log = logging.getLogger(__name__)
-@@ -457,23 +460,58 @@ def get_user_id_from_session_pool(sid):
+@@ -457,23 +461,74 @@ def get_user_id_from_session_pool(sid):
  
  LOCAL_AUTHENTICATED_SIDS: set[str] = set()
  
@@ -22,8 +24,14 @@ index 1338308..63856f8 100644
 +# at once, each reconnect needs the same backend to verify its token, and the resulting load keeps the
 +# backend unavailable (self-sustaining reconnect storm).
 +TRANSIENT_BACKEND_ERRORS = (SQLAlchemyError, RedisError, asyncio.TimeoutError, TimeoutError, ConnectionError)
-+SOCKET_REAUTH_INTERVAL = 30
++SOCKET_REAUTH_INTERVAL = max(int(os.getenv('SOCKET_REAUTH_INTERVAL', '30')), 10)
 +SOCKET_REAUTH_JITTER = 15
++# A single re-verification must not wait DATABASE_POOL_TIMEOUT for a connection: a sweep over hundreds of sockets
++# with a saturated pool would then run for hours. After this many seconds the check counts as "could not verify".
++SOCKET_REAUTH_CHECK_TIMEOUT = max(float(os.getenv('SOCKET_REAUTH_CHECK_TIMEOUT', '5')), 1.0)
++# Heartbeats arrive every 30 s per socket; writing user.last_active_at on each one is one UPDATE + commit per socket
++# per 30 s. Write it at most this often per socket instead.
++HEARTBEAT_LAST_ACTIVE_WRITE_INTERVAL = max(int(os.getenv('HEARTBEAT_LAST_ACTIVE_WRITE_INTERVAL', '300')), 30)
 +
 +
 +def is_transient_backend_error(exc: BaseException) -> bool:
@@ -38,10 +46,19 @@ index 1338308..63856f8 100644
 -        await asyncio.sleep(30)
 +        # Jitter so that workers do not all hit the database in the same second.
 +        await asyncio.sleep(SOCKET_REAUTH_INTERVAL + random.uniform(0, SOCKET_REAUTH_JITTER))
++        sweep_started = time.monotonic()
          await encryption.sweep()
-         for sid in tuple(LOCAL_AUTHENTICATED_SIDS):
+-        for sid in tuple(LOCAL_AUTHENTICATED_SIDS):
++        for i, sid in enumerate(tuple(LOCAL_AUTHENTICATED_SIDS)):
++            if i % 50 == 49:
++                await asyncio.sleep(0)  # let heartbeats and requests run between checks
              await get_socket_session_user(sid)
  
++        sweep_took = time.monotonic() - sweep_started
++        if sweep_took > SOCKET_REAUTH_INTERVAL:
++            log.warning('Socket re-verification sweep took %.0fs for %d sockets (interval %ds)',
++                        sweep_took, len(LOCAL_AUTHENTICATED_SIDS), SOCKET_REAUTH_INTERVAL)
++
  
  async def get_socket_session_user(sid: str, *, wait_for_disconnect: bool = True) -> dict | None:
 -    """Session user from this worker's local Socket.IO store; only locally connected sids are ever looked up."""
@@ -61,7 +78,9 @@ index 1338308..63856f8 100644
 +
 +    if session and session.get('user'):
 +        try:
-+            if await get_verified_user_by_token(session.get('token', ''), REDIS):
++            if await asyncio.wait_for(
++                get_verified_user_by_token(session.get('token', ''), REDIS), timeout=SOCKET_REAUTH_CHECK_TIMEOUT
++            ):
 +                return session['user']
 +            log.debug('Socket authentication expired for %s', sid)
 +        except Exception as e:
@@ -77,7 +96,7 @@ index 1338308..63856f8 100644
      LOCAL_AUTHENTICATED_SIDS.discard(sid)
      if wait_for_disconnect:
          await sio.disconnect(sid)
-@@ -614,7 +652,22 @@ async def connect(sid, environ, auth):
+@@ -614,7 +669,22 @@ async def connect(sid, environ, auth):
          scope = (environ or {}).get('asgi.scope') or {}
          fastapi_app = scope.get('app')
          redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
@@ -101,7 +120,7 @@ index 1338308..63856f8 100644
  
          if user:
              socket_user = {
-@@ -645,7 +698,13 @@ async def user_join(sid, data):
+@@ -645,7 +715,13 @@ async def user_join(sid, data):
      scope = environ.get('asgi.scope') or {}
      fastapi_app = scope.get('app')
      redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
@@ -116,23 +135,47 @@ index 1338308..63856f8 100644
      if not user:
          return
  
-@@ -722,6 +781,14 @@ async def refresh_chat_access(chat_id=None):
+@@ -722,15 +798,33 @@ async def refresh_chat_access(chat_id=None):
  
  @sio.on('heartbeat')
  async def heartbeat(sid, data):
+-    user = await get_socket_session_user(sid)
+-    if user:
 +    try:
 +        session = await sio.get_session(sid)
 +    except Exception:
 +        session = None
 +    if not session or not session.get('user'):
-+        # Anonymous socket (login page, or a token that was never accepted): nothing to refresh, and
-+        # disconnecting it would only make the client reconnect and re-fetch everything.
++        # Anonymous socket (login page): nothing to refresh, and disconnecting it would only make the client
++        # reconnect and re-fetch everything.
 +        return
-     user = await get_socket_session_user(sid)
-     if user:
++    user = session['user']
++    now = int(time.time())
++    try:
          SESSION_POOL[sid] = {
+             **(SESSION_POOL.get(sid) or {}),
+             **user,
+-            'last_seen_at': int(time.time()),
++            'last_seen_at': now,
+         }
+-        await Users.update_last_active_by_id(user['id'])
+-
++    except Exception as e:
++        log.debug('heartbeat: could not refresh session pool for %s: %s', sid, e)
++    if now - session.get('last_active_written_at', 0) >= HEARTBEAT_LAST_ACTIVE_WRITE_INTERVAL:
++        try:
++            await Users.update_last_active_by_id(user['id'])
++            session['last_active_written_at'] = now
++            await sio.save_session(sid, session)
++        except Exception as e:
++            if not is_transient_backend_error(e):
++                raise
++            log.debug('heartbeat: could not update last_active_at for %s: %s', sid, e)
+ 
+ @sio.on('join-channels')
+ async def join_channel(sid, data):
 diff --git a/src/lib/components/layout/Sidebar.svelte b/src/lib/components/layout/Sidebar.svelte
-index 3ddd1ae..9404f78 100644
+index 3ddd1ae0..9404f786 100644
 --- a/src/lib/components/layout/Sidebar.svelte
 +++ b/src/lib/components/layout/Sidebar.svelte
 @@ -530,7 +530,16 @@
@@ -153,7 +196,7 @@ index 3ddd1ae..9404f78 100644
  		if (result.accepted) {
  			await initFolders();
 diff --git a/src/routes/+layout.svelte b/src/routes/+layout.svelte
-index aaf4851..8c07498 100644
+index aaf4851d..8c074989 100644
 --- a/src/routes/+layout.svelte
 +++ b/src/routes/+layout.svelte
 @@ -188,14 +188,56 @@

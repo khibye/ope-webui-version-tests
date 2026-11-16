@@ -58,6 +58,33 @@ shared `localStorage.token`, the others keep a stale UI with an anonymous socket
 
 Published image (fix #1 + #2): `ghcr.io/khibye/ope-webui-version-tests/open-webui:v0.12.5-fix-88d6a0f70614f855a5bba06e26a86cc2b9ea8e27`
 
+## Fix #3: cheaper keepalive, bounded sweep - v0.12.5
+
+Commit `aebacef`. Run: https://github.com/khibye/ope-webui-version-tests/actions/runs/43850362548 (2026-11-16)
+
+Motivation: with the storms gone, production pods (one uvicorn worker each) stayed CPU-bound while PostgreSQL was
+nearly idle (1 active query, 40 connections "idle in transaction"). In 0.12.5 every connected socket costs, while
+doing nothing: a heartbeat every 30 s = JWT decode + 2 DB reads + `UPDATE user.last_active_at` + commit + 2 blocking
+Redis calls, plus one more DB read per socket per sweep; and each sweep check waited up to `DATABASE_POOL_TIMEOUT`
+(30 s in production) for a pool connection, so one sweep over a few hundred sockets could run for hours.
+
+Changes: heartbeat only refreshes `last_seen` in Redis and writes `last_active_at` at most every
+`HEARTBEAT_LAST_ACTIVE_WRITE_INTERVAL` (300 s); each sweep check is bounded by `SOCKET_REAUTH_CHECK_TIMEOUT` (5 s,
+overrun = "could not verify", session kept); the sweep yields every 50 sockets and warns when it overruns
+`SOCKET_REAUTH_INTERVAL` (env, default 30). Token revocation is still enforced by the sweep every 30-45 s.
+
+| trigger | pool timeouts | reconnects after trigger | 401 last 2 min | tabs on login page | verdict |
+|---|---|---|---|---|---|
+| PostgreSQL paused 45 s | 0 | 0 | - | - | no loop |
+| Redis removed 60 s | 0 | 0 | - | - | no loop (6 pre-existing tracebacks in Redis listeners, as unpatched) |
+| revoke all sessions | 0 | 47 (burst, then 0) | 0 | 16 / 16 | FIXED |
+
+During the DB pause the sweep logged `Socket re-verification sweep took 69s for 20 sockets (interval 30s)`: expected,
+each check hit its 5 s cap. Next improvement if that warning shows up in production: a per-sweep deadline that stops at
+the interval and resumes from the same position next time.
+
+Published image (fix #1 + #2 + #3): `ghcr.io/khibye/ope-webui-version-tests/open-webui:v0.12.5-fix-aebacef670e46c41c9c03dc19284431efaaf602b`
+
 ## Proof that the stall happened and the new code path handled it
 
 During the 45 s pause the periodic re-verification sweep did hit the dead database. With the fix the server logged,

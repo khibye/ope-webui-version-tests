@@ -2,7 +2,7 @@
 
 Fields:
 - Installation Method: Kubernetes, image `ghcr.io/open-webui/open-webui:v0.12.5` ([Helm chart / manifests])
-- Open WebUI Version: v0.12.5 in production; reproduced on v0.13.3 (`b0e6098`) and dev (`2547992`, `67be4e96`)
+- Open WebUI Version: v0.12.5 in production; reproduced on v0.13.3 (`b0e6098`) and dev (`2547992`, `67be4e96`). The code involved first appears in v0.12.0 (v0.11.4 has none of it).
 - Operating System: [node OS], Kubernetes [version], PostgreSQL [version], Redis Cluster [version], 9 replicas, 1 uvicorn worker each
 - Browser: [Chrome xxx]
 - Ollama Version: N/A

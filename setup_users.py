@@ -7,6 +7,7 @@ after that, so the remaining users are created by the admin via /api/v1/auths/ad
 and then signed in to obtain their tokens. Existing users are simply signed in.
 
 Usage:  python3 setup_users.py --url http://localhost:3000 --users 5
+        python3 setup_users.py --url https://staging.example.com --users 5 --admin-token <token>   # existing instance
 Output: tokens.json  ->  [{"email": ..., "token": ...}, ...]
 """
 import argparse
@@ -46,6 +47,7 @@ def main():
     ap.add_argument("--url", default="http://localhost:3000")
     ap.add_argument("--users", type=int, default=5)
     ap.add_argument("--out", default="tokens.json")
+    ap.add_argument("--admin-token", default="", help="existing admin token: create all users via /auths/add (for a staging instance that already has an admin)")
     args = ap.parse_args()
     base = args.url.rstrip("/")
 
@@ -55,7 +57,7 @@ def main():
     for i in range(args.users):
         email = f"repro{i:03d}@example.com"
         name = f"Repro User {i:03d}"
-        if i == 0:
+        if i == 0 and not args.admin_token:
             # First user on an empty instance: public signup -> becomes admin.
             try:
                 res = post(f"{base}/api/v1/auths/signup", {"name": name, "email": email, "password": PASSWORD})
@@ -67,6 +69,8 @@ def main():
                 how = "signin"
             admin_token = res.get("token")
         else:
+            if args.admin_token:
+                admin_token = args.admin_token
             # 0.13.x disables public signup once an admin exists, so the admin creates the rest.
             try:
                 post(f"{base}/api/v1/auths/add",

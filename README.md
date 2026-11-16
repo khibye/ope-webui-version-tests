@@ -5,7 +5,8 @@
 - [02 - Code analysis: why it loops](reports/02-code-analysis.md) (line references for v0.12.5, v0.13.3, dev)
 - [03 - Reproduction results](reports/03-reproduction-results.md) - **reproduced on v0.13.3 and dev** with a 45 s DB stall
 - [04 - Mitigations and operational recommendations](reports/04-mitigations.md)
-- [05 - Draft for the upstream issue](reports/05-issue-draft.md)
+- [05 - Upstream issue text (final)](reports/05-issue-final.md) / [earlier draft](reports/05-issue-draft.md)
+- [07 - PR description](reports/07-pr-description.md) - `patches/0001-*.patch` is the commit against upstream `dev`
 - [06 - Fix verification](reports/06-fix-verification.md) - **the fix removes the loop** (branch `fix/socket-reconnect-storm`, `patches/`)
 - `tools/revoke_sessions.py` - parallel "Sign out all devices" for users active in the last N days (what stopped the incident)
 

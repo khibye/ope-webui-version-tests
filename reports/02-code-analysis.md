@@ -4,6 +4,10 @@ The bug is not the WebSocket/Redis architecture (socket.io with a Redis manager 
 **positive feedback loop with no damping**: load causes failures, failures cause disconnects, disconnects cause
 reconnects, reconnects cause load. Each piece is reasonable on its own; together they form a retry storm.
 
+**Affected since v0.12.0 (2026-10-10).** The periodic re-verification (D), the disconnect-on-any-exception (E) and the
+client's immediate reconnect (A) all first appear in v0.12.0; v0.11.4 has none of them. They are unchanged through
+v0.12.5, v0.13.3 and dev. This matches #32338 ("since 0.12.0").
+
 All line numbers below were checked on the three versions. They are the same code; only the numbers differ.
 
 | # | Component | v0.12.5 | v0.13.3 (`b0e6098`) | dev (`2547992`, 2026-11-12) |

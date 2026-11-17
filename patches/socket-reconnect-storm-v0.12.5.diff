@@ -1,8 +1,16 @@
 diff --git a/backend/open_webui/socket/main.py b/backend/open_webui/socket/main.py
-index 1338308f..451974a3 100644
+index 1338308f..f3be808f 100644
 --- a/backend/open_webui/socket/main.py
 +++ b/backend/open_webui/socket/main.py
-@@ -65,8 +65,12 @@ from open_webui.utils.redis import (
+@@ -56,6 +56,7 @@ from open_webui.tasks import (
+ from open_webui.utils.access_control import has_permission
+ from open_webui.utils.access_control.files import has_access_to_note_files
+ from open_webui.utils.auth import get_verified_user_by_token
++from open_webui.utils.auth import decode_token, get_verified_user_by_id, is_valid_token
+ from open_webui.utils.chat_id import is_saved_chat_id
+ from open_webui.utils.json_codec import SOCKETIO_JSON, JSONCodec, dumps_bytes
+ from open_webui.utils.misc import get_output_text
+@@ -65,8 +66,12 @@ from open_webui.utils.redis import (
      get_redis_connection,
      get_sentinels_from_env,
  )
@@ -15,7 +23,7 @@ index 1338308f..451974a3 100644
  
  logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
  log = logging.getLogger(__name__)
-@@ -457,23 +461,74 @@ def get_user_id_from_session_pool(sid):
+@@ -457,23 +462,74 @@ def get_user_id_from_session_pool(sid):
  
  LOCAL_AUTHENTICATED_SIDS: set[str] = set()
  
@@ -96,13 +104,18 @@ index 1338308f..451974a3 100644
      LOCAL_AUTHENTICATED_SIDS.discard(sid)
      if wait_for_disconnect:
          await sio.disconnect(sid)
-@@ -614,7 +669,22 @@ async def connect(sid, environ, auth):
+@@ -614,7 +670,27 @@ async def connect(sid, environ, auth):
          scope = (environ or {}).get('asgi.scope') or {}
          fastapi_app = scope.get('app')
          redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
 -        user = await get_verified_user_by_token(auth['token'], redis)
++        token_valid = False
 +        try:
-+            user = await get_verified_user_by_token(auth['token'], redis)
++            decoded = decode_token(auth['token']) if auth['token'] else None
++            if decoded is not None and 'id' in decoded:
++                token_valid = await is_valid_token(decoded, redis)
++            # A valid session whose role is not verified (e.g. 'pending') stays an anonymous socket, as before.
++            user = await get_verified_user_by_id(decoded['id']) if token_valid else None
 +        except Exception as e:
 +            if not is_transient_backend_error(e):
 +                raise
@@ -111,7 +124,7 @@ index 1338308f..451974a3 100644
 +            log.warning('Refusing socket %s: backend unavailable during token verification (%s)', sid, e)
 +            raise SocketConnectionRefusedError('backend_unavailable', {'retry': True}) from None
 +
-+        if user is None and auth['token']:
++        if not token_valid and auth['token']:
 +            # The token was supplied but is invalid (expired or revoked). Refuse the handshake instead of
 +            # accepting an anonymous socket that every heartbeat would then disconnect, which makes the
 +            # client reconnect and re-fetch the whole sidebar in a loop (a 401 storm after a mass revoke).
@@ -120,7 +133,7 @@ index 1338308f..451974a3 100644
  
          if user:
              socket_user = {
-@@ -645,7 +715,13 @@ async def user_join(sid, data):
+@@ -645,7 +721,13 @@ async def user_join(sid, data):
      scope = environ.get('asgi.scope') or {}
      fastapi_app = scope.get('app')
      redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
@@ -135,7 +148,7 @@ index 1338308f..451974a3 100644
      if not user:
          return
  
-@@ -722,15 +798,33 @@ async def refresh_chat_access(chat_id=None):
+@@ -722,15 +804,33 @@ async def refresh_chat_access(chat_id=None):
  
  @sio.on('heartbeat')
  async def heartbeat(sid, data):

@@ -239,6 +239,36 @@ async def heartbeat(sid, data):
         sys.exit("user_join anchor not found")
     server.write_text(s[:fn_start] + fn.replace(old_snip, new_snip) + s[fn_end:])
 
+    # --- connect: refuse only an INVALID token. A valid session whose user is not a verified role (for example
+    # 'pending', the default role for new SSO users) must not be refused as 'unauthorized': the client would sign
+    # the user out. get_verified_user_by_token() returns None for both cases, so check the token and the role
+    # separately (same two queries as before).
+    edit(
+        server,
+        "from open_webui.utils.auth import get_verified_user_by_token\n",
+        "from open_webui.utils.auth import get_verified_user_by_token\n"
+        "from open_webui.utils.auth import decode_token, get_verified_user_by_id, is_valid_token\n",
+    )
+    edit(
+        server,
+        "        try:\n"
+        "            user = await get_verified_user_by_token(auth['token'], redis)\n"
+        "        except Exception as e:\n",
+        "        token_valid = False\n"
+        "        try:\n"
+        "            decoded = decode_token(auth['token']) if auth['token'] else None\n"
+        "            if decoded is not None and 'id' in decoded:\n"
+        "                token_valid = await is_valid_token(decoded, redis)\n"
+        "            # A valid session whose role is not verified (e.g. 'pending') stays an anonymous socket, as before.\n"
+        "            user = await get_verified_user_by_id(decoded['id']) if token_valid else None\n"
+        "        except Exception as e:\n",
+    )
+    edit(
+        server,
+        "        if user is None and auth['token']:\n",
+        "        if not token_valid and auth['token']:\n",
+    )
+
     # ------------------------------------------------------------------ client: +layout.svelte
     edit(
         layout,

@@ -139,6 +139,12 @@ def is_transient_backend_error(exc: BaseException) -> bool:
                 return session['user']
             log.debug('Socket authentication check failed for %s', sid, exc_info=True)
 
+    if not (session and session.get('user')):
+        # Never authenticated (login page, or a tab whose token was cleared by another tab): ignore the event
+        # and keep the socket. Disconnecting it makes clients reconnect at once and re-send the same event
+        # (e.g. the chat page's events:chat join on every connect): a reconnect loop of many per second.
+        return None
+
     LOCAL_AUTHENTICATED_SIDS.discard(sid)
     if wait_for_disconnect:
         await sio.disconnect(sid)

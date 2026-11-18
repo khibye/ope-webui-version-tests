@@ -1,5 +1,5 @@
 diff --git a/backend/open_webui/socket/main.py b/backend/open_webui/socket/main.py
-index 1338308f..f3be808f 100644
+index 1338308f..2a6cd7c3 100644
 --- a/backend/open_webui/socket/main.py
 +++ b/backend/open_webui/socket/main.py
 @@ -56,6 +56,7 @@ from open_webui.tasks import (
@@ -23,7 +23,7 @@ index 1338308f..f3be808f 100644
  
  logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
  log = logging.getLogger(__name__)
-@@ -457,23 +462,74 @@ def get_user_id_from_session_pool(sid):
+@@ -457,23 +462,80 @@ def get_user_id_from_session_pool(sid):
  
  LOCAL_AUTHENTICATED_SIDS: set[str] = set()
  
@@ -101,10 +101,16 @@ index 1338308f..f3be808f 100644
 +                return session['user']
 +            log.debug('Socket authentication check failed for %s', sid, exc_info=True)
 +
++    if not (session and session.get('user')):
++        # Never authenticated (login page, or a tab whose token was cleared by another tab): ignore the event
++        # and keep the socket. Disconnecting it makes clients reconnect at once and re-send the same event
++        # (e.g. the chat page's events:chat join on every connect): a reconnect loop of many per second.
++        return None
++
      LOCAL_AUTHENTICATED_SIDS.discard(sid)
      if wait_for_disconnect:
          await sio.disconnect(sid)
-@@ -614,7 +670,27 @@ async def connect(sid, environ, auth):
+@@ -614,7 +676,27 @@ async def connect(sid, environ, auth):
          scope = (environ or {}).get('asgi.scope') or {}
          fastapi_app = scope.get('app')
          redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
@@ -133,7 +139,7 @@ index 1338308f..f3be808f 100644
  
          if user:
              socket_user = {
-@@ -645,7 +721,13 @@ async def user_join(sid, data):
+@@ -645,7 +727,13 @@ async def user_join(sid, data):
      scope = environ.get('asgi.scope') or {}
      fastapi_app = scope.get('app')
      redis = getattr(getattr(fastapi_app, 'state', None), 'redis', None) or REDIS
@@ -148,7 +154,7 @@ index 1338308f..f3be808f 100644
      if not user:
          return
  
-@@ -722,15 +804,33 @@ async def refresh_chat_access(chat_id=None):
+@@ -722,15 +810,33 @@ async def refresh_chat_access(chat_id=None):
  
  @sio.on('heartbeat')
  async def heartbeat(sid, data):

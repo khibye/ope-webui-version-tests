@@ -70,6 +70,7 @@ services:
 
       # --- make user creation via API possible ---
       ENABLE_SIGNUP: "true"
+      ENABLE_CHANNELS: "${ENABLE_CHANNELS:-true}"
       DEFAULT_USER_ROLE: user
 
       # --- no model backends needed for this bug ---

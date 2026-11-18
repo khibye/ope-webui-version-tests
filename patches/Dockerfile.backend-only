@@ -1,0 +1,5 @@
+# The official image with ONLY the patched backend file: models a deployment where the server is patched
+# but users' open tabs still run the old frontend they loaded before the deploy.
+ARG BASE_IMAGE=ghcr.io/open-webui/open-webui:v0.12.5
+FROM ${BASE_IMAGE}
+COPY backend/open_webui/socket/main.py /app/backend/open_webui/socket/main.py

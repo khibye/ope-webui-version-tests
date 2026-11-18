@@ -69,7 +69,9 @@ printf "image=%s\nrevision=%s\ndigest=%s\n" "$IMG" "$REV" "$DIGEST" > "$OUT/imag
 # ---------- 2. users & tabs ----------
 python3 setup_users.py --url "$URL" --users "$USERS" --out "$OUT/tokens.json" | tee -a "$OUT/run.log" || exit 1
 log "Opening $((USERS*TABS)) tabs ..."
-python3 open_tabs.py --url "$URL" --tokens "$OUT/tokens.json" --users "$USERS" --tabs-per-user "$TABS" \
+EXTRA_TAB_ARGS="--request-log $OUT/requests.csv --final-state $OUT/final_state.json"
+[ "${OPEN_CHAT:-0}" = "1" ] && EXTRA_TAB_ARGS="$EXTRA_TAB_ARGS --open-chat"
+python3 open_tabs.py --url "$URL" --tokens "$OUT/tokens.json" --users "$USERS" --tabs-per-user "$TABS" $EXTRA_TAB_ARGS \
   --duration $((BASELINE_S + OBSERVE_S + 120)) --csv "$OUT/tabs_stats.csv" > "$OUT/tabs.log" 2>&1 &
 TABS_PID=$!
 sleep 35   # page loads + 20 s warm-up inside open_tabs.py
@@ -94,6 +96,7 @@ if [ "$DB_LATENCY_MS" -gt 0 ]; then
   snapshot "$(date -u -d '20 seconds ago' +%Y-%m-%dT%H:%M:%SZ)"
 fi
 T_TRIG=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+T_TRIG_EPOCH=$(date +%s)
 case "$MODE" in
   redis)
     log "TRIGGER: removing the Redis container for ${REDIS_DOWN_S}s, then recreating it empty (like a rescheduled pod)"
@@ -193,5 +196,33 @@ WS_AFTER=$(awk -F, -v t="$(date -d "$T_TRIG" +%H:%M:%S 2>/dev/null || echo 00:00
   fi
   echo "artifacts: $OUT/  (open-webui.log, redis.log, tabs_stats.csv, observe.log)"
 } | tee -a "$OUT/run.log"
+
+# Per-request analysis: what do the tabs that never left actually request, and in which order?
+python3 - "$OUT/requests.csv" "$OUT/final_state.json" "$T_TRIG_EPOCH" <<'PY' | tee -a "$OUT/run.log"
+import csv, json, sys
+from collections import Counter
+rows = list(csv.DictReader(open(sys.argv[1])))
+states = {s["tab"]: s for s in json.load(open(sys.argv[2]))}
+trig = float(sys.argv[3])
+after = [r for r in rows if float(r["ts"]) >= trig]
+end = max((float(r["ts"]) for r in rows), default=trig)
+late = [r for r in after if float(r["ts"]) >= end - 120]
+print("\n================ REQUESTS AFTER THE TRIGGER (per route, status) ================")
+for (path, st), n in Counter((r["path"], r["status"]) for r in after).most_common(25):
+    print(f"{n:6d}  {st:>4}  {path}")
+print("\n---- last 2 minutes, per tab (tab: requests | final path | token in localStorage) ----")
+per_tab = Counter(int(r["tab"]) for r in late)
+for tab in sorted(states):
+    s = states[tab]
+    print(f"tab {tab:2d} user {s.get('user')}: {per_tab.get(tab, 0):5d} | {s.get('path')} | token={s.get('token')}")
+stuck = [t for t, n in per_tab.most_common() if n > 0]
+if stuck:
+    t = stuck[0]
+    seq = [r for r in after if int(r["tab"]) == t][-60:]
+    t0 = float(seq[0]["ts"]) if seq else 0
+    print(f"\n---- request sequence of the busiest tab ({t}), last {len(seq)} requests ----")
+    for r in seq:
+        print(f"+{float(r['ts']) - t0:7.2f}s  {r['method']:6} {r['status']:>4}  {r['path']}")
+PY
 
 log "Stack left running for inspection. Stop with: docker compose down -v"

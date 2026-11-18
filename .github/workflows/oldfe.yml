@@ -1,0 +1,70 @@
+name: Old frontend vs patched backend (revoke, chat open)
+
+# Models production after the deploy: the server runs the patched backend, but tabs opened before the deploy
+# still run the old 0.12.5 frontend. Tabs are opened on a chat page with channels enabled, the admin revokes
+# every other user's sessions, and every request of every tab is logged.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    name: "${{ matrix.variant }} (revoke, chat open)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ["old-frontend+patched-backend", "unpatched", "patched"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone Open WebUI v0.12.5 and apply the fix
+        if: matrix.variant != 'unpatched'
+        run: |
+          git clone --depth 1 --branch v0.12.5 https://github.com/open-webui/open-webui.git upstream
+          python3 patches/apply_fix.py upstream
+
+      - name: Build backend-only image (old frontend, patched server)
+        if: matrix.variant == 'old-frontend+patched-backend'
+        run: |
+          docker build -f patches/Dockerfile.backend-only --build-arg BASE_IMAGE=ghcr.io/open-webui/open-webui:v0.12.5 \
+            -t owui-test:local upstream
+          echo "OWUI_IMAGE=owui-test:local" >> "$GITHUB_ENV"
+          echo "OWUI_IMAGE_LOCAL=1" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        if: matrix.variant == 'patched'
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: upstream/package-lock.json
+
+      - name: Build fully patched image
+        if: matrix.variant == 'patched'
+        run: |
+          cd upstream && ONNXRUNTIME_NODE_INSTALL_CUDA=skip npm ci --force && npm run build && cd ..
+          docker build -f patches/Dockerfile.patched --build-arg BASE_IMAGE=ghcr.io/open-webui/open-webui:v0.12.5 \
+            -t owui-test:local upstream
+          echo "OWUI_IMAGE=owui-test:local" >> "$GITHUB_ENV"
+          echo "OWUI_IMAGE_LOCAL=1" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Playwright
+        run: |
+          pip install playwright
+          python3 -m playwright install --with-deps chromium
+
+      - name: Run the revoke scenario with tabs on a chat page
+        env:
+          OPEN_CHAT: "1"
+          LABEL: ${{ matrix.variant }}
+        run: |
+          chmod +x run_check.sh
+          ./run_check.sh v0.12.5 revoke
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v || true
